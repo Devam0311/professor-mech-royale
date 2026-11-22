@@ -8,9 +8,8 @@ It is built around three priorities:
   only when the torso will really be on target when the shot leaves.
 - **Laser first:** it remembers lasers it has seen, goes for them before optional fights,
   swaps out weaker weapons, and releases full charges once locked on.
-- **Controlled aggression:** it chases and finishes wounded targets, runs when it is badly
-  hurt, outnumbered at low health or losing health too fast, and under pressure it ducks
-  behind cover while its weapon recovers, then steps back out to shoot.
+- **Controlled aggression:** it chases and prefers wounded targets. When badly hurt or
+  outnumbered at low health it runs to cover and holds fire so that it can regenerate.
 
 ## Files
 
