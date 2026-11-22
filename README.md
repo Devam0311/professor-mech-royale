@@ -8,8 +8,9 @@ It is built around three priorities:
   only when the torso will really be on target when the shot leaves.
 - **Laser first:** it remembers lasers it has seen, goes for them before optional fights,
   swaps out weaker weapons, and releases full charges once locked on.
-- **Aggression:** it chases, prefers wounded targets, and only breaks off when badly hurt
-  or outnumbered at low health.
+- **Controlled aggression:** it chases and finishes wounded targets, runs when it is badly
+  hurt, outnumbered at low health or losing health too fast, and under pressure it ducks
+  behind cover while its weapon recovers, then steps back out to shoot.
 
 ## Files
 
@@ -35,3 +36,6 @@ docker run --rm -i professor
   notes and small parts of its source were read, and its ideas were an inspiration.
   Those notes credit TigerTown27, giddygiddyboy and other public Buildathon teams.
   No code was copied from these projects.
+- The READMEs (not the code) of azz0048/Mech-Royale, sparshagra/AIEthicsTuts and
+  andrew-zhouu/builders-mech-royale-2026 were viewed during development. The latter two
+  ask not to be reused by other teams, and nothing was taken from them.

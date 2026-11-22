@@ -7,6 +7,7 @@ from arena import Arena
 from gunnery import Track, angles, arc_points, clamp, lead, lob, on_target, slew, wrap
 
 DECISION = 0.1  # replaced by the configured value at start-up
+DANGER_SECONDS = 5.0  # run when we would be dead this soon
 RETREAT_HP, RETURN_HP = 0.25, 0.55  # health fractions for breaking off and rejoining
 HEADINGS = [k * math.tau / 20 for k in range(20)]
 UPGRADES = ["laser_damage", "laser_charge", "gun_damage", "gun_velocity", "gun_rate", "plating",
@@ -32,6 +33,10 @@ class Professor:
         self.attackers = {}  # id -> time it last hurt us
         self.target = None
         self.retreating = False
+        self.retreat_since = -math.inf
+        self.hurt = []  # (time, damage) over the last few seconds
+        self.contact = -math.inf
+        self.peek = None  # (target id, where we last had a shot at it, when)
         self.errand = (None, 0.0)
         self.path, self.path_goal, self.path_time = [], None, -math.inf
         self.cover, self.cover_time = None, -math.inf
@@ -68,6 +73,8 @@ class Professor:
 
         for event in obs["events"]:
             kind = event["type"]
+            if kind == "damaged" and event.get("weapon") != "zone":
+                self.hurt.append((now, event["amount"]))
             if kind == "damaged" and event.get("bearing") is not None:
                 self.alert = (event["bearing"], now)
                 if event.get("by") is not None:
@@ -79,6 +86,7 @@ class Professor:
                     self.items.pop(event["id"], None)
                 else:
                     self.skipped[event["id"]] = now + 2
+        self.hurt = [(when, amount) for when, amount in self.hurt if now - when < 3]
         if self.alert is None or now - self.alert[1] > 2:
             for sound in obs["sounds"]:
                 if sound["kind"] in ("gun", "laser", "laser_charge", "lightning") and sound["dist"] != "far":
@@ -129,36 +137,76 @@ class Professor:
         self.target = best["id"] if best else None
         return best
 
-    def update_retreat(self):
-        shooters = sum(1 for e in self.enemies if e["mech"] and e["point"] and e["distance"] < 140)
-        overwhelmed = shooters >= 3 and self.hp < 0.5
-        if self.hp < RETREAT_HP or overwhelmed:
-            self.retreating = True
-        elif self.hp >= RETURN_HP:
-            self.retreating = False
+    def damage_output(self):
+        """Rough damage per second we deal while we have a shot."""
+        total = 0.0
+        for kind, (_, weapon) in self.slots.items():
+            spec = weapon["stats"]
+            if kind == "gun":
+                total += spec["damage"] * spec["mag"] / (spec["mag"] * spec["cooldown"] + spec["reload"]) * 0.8
+            elif kind == "laser":
+                total += spec["damage"] / (spec["charge"] + spec["cooldown"])
+        return total
 
-    def cover_spot(self, threats):
-        if self.cover and self.t - self.cover_time < 0.8:
+    def update_retreat(self, target):
+        shooters = sum(1 for e in self.enemies if e["mech"] and e["point"] and e["distance"] < 140)
+        incoming = sum(amount for _, amount in self.hurt) / 3
+        time_left = self.me["hp"] / incoming if incoming else math.inf
+        danger = time_left < DANGER_SECONDS
+        overwhelmed = shooters >= 3 and self.hp < 0.5
+
+        # Stay aggressive when the target will clearly die before we do.
+        finishing = False
+        if target and target["mech"] and target["point"] and shooters < 3:
+            kill_time = target["info"].get("hp", math.inf) / max(1.0, self.damage_output())
+            finishing = kill_time < min(3.0, time_left * 0.6)
+
+        if finishing:
+            self.retreating = False
+        elif self.hp < RETREAT_HP or overwhelmed or danger:
+            if not self.retreating:
+                self.retreating, self.retreat_since = True, self.t
+        elif self.hp >= RETURN_HP and self.t - self.retreat_since > 2:
+            self.retreating = False
+        self.finishing = finishing
+        self.pressured = bool(self.hurt) and (self.hp < 0.75 or shooters >= 2)
+
+    def cover_spot(self, threats, peeking=False):
+        """Find a hiding place. When peeking it has to be close and really hidden."""
+        if self.t - self.cover_time < 0.5:
             return self.cover
         x, y, z = self.pos
         centre, radius = self.obs["zone"]["center"], self.obs["zone"]["radius"]
         best, best_score = None, -math.inf
-        for distance in (15, 35):
+        for distance in ((6, 12, 20) if peeking else (10, 22, 40)):
             for heading in HEADINGS[::2]:
                 px, py = x + distance * math.cos(heading), y + distance * math.sin(heading)
                 if flat_distance((px, py), centre) > radius or not self.arena.walkable(px, py):
                     continue
-                score = -distance * 0.5
+                score = -distance * (2.0 if peeking else 0.5)
                 ground = self.arena.ground(px, py) if self.arena.ready else z
+                hidden = 0
                 for threat in threats[:2]:
                     tx, ty, tz = threat["info"]["pos"]
                     if not self.arena.clear([tx, ty, tz + 7], [px, py, ground + 6]):
                         score += 100
-                    score += 0.3 * flat_distance((px, py), (tx, ty))
+                        hidden += 1
+                    elif not peeking:
+                        score += 0.5 * flat_distance((px, py), (tx, ty))
+                if peeking and not hidden:
+                    continue
                 if score > best_score:
                     best, best_score = (px, py, z), score
         self.cover, self.cover_time = best, self.t
         return best
+
+    def ready_to_peek(self):
+        """Step out just before the main weapon can fire, step back while it recovers."""
+        if "laser" in self.slots:
+            weapon = self.slots["laser"][1]
+            return bool(weapon.get("charge")) or weapon["cooldown"] < 0.6
+        gun = self.slots.get("gun")
+        return not gun or (gun[1].get("reload") or 0) < 0.5
 
     def nearest_item(self, category, limit, kind=None, climb=3.0):
         zone = self.obs["zone"]
@@ -203,10 +251,29 @@ class Professor:
                 return (next_centre[0], next_centre[1], z), True
 
         threats = sorted((e for e in self.enemies if e["mech"] and e["point"]), key=lambda e: e["distance"])
-        if self.retreating and threats:
-            spot = self.cover_spot(threats)
-            if spot:
-                return spot, True
+        if threats:
+            self.contact = self.t
+        if self.retreating:
+            if threats:
+                spot = self.cover_spot(threats)
+                if spot:
+                    return spot, True
+            elif self.cover and self.t - self.contact < 4:
+                return self.cover, True  # they lost sight of us, so stay put and heal
+
+        # Fighting from cover: shoot, duck back, then return to the same firing spot.
+        if target and target["mech"] and not self.retreating and not self.finishing:
+            if target["point"]:
+                self.peek = (target["id"], tuple(pos), self.t)
+                if self.pressured and not self.ready_to_peek():
+                    spot = self.cover_spot(threats, peeking=True)
+                    if spot:
+                        return spot, True
+            elif self.peek and self.peek[0] == target["id"] and self.t - self.peek[2] < 4:
+                if not self.ready_to_peek():
+                    return pos, False
+                if flat_distance(pos, self.peek[1]) > 2:
+                    return self.peek[1], True
 
         cube = self.nearest_item("cube", 25 if threats else 70)
         if cube:
@@ -578,7 +645,7 @@ class Professor:
     def act(self, obs):
         self.observe(obs)
         target = self.choose_target()
-        self.update_retreat()
+        self.update_retreat(target)
         goal, hurry = self.choose_goal(target)
         move, boost, jump = self.steer(goal, hurry)
         aim, fire, reload = self.shoot(target)
